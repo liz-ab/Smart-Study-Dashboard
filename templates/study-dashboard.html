@@ -414,7 +414,7 @@ body { font-family:'DM Sans',sans-serif; background:var(--cream); color:var(--fo
   <div class="tracker-layout">
     <div class="pixel-box webcam-box">
       <div class="webcam-preview">
-        <video id="webcam-video" autoplay muted playsinline></video>
+        <img id="webcam-video" style="display:none;width:100%;height:100%;object-fit:cover" alt="live webcam feed">
         <div class="cam-placeholder" id="cam-placeholder">
           <div style="font-size:40px">📷</div>
           <div>click start to<br>enable webcam</div>
@@ -950,76 +950,89 @@ updateMiniPomo(); updateBigPomo();
 // ═══════════════════════════════════════
 // ATTENTION TRACKER + FATIGUE
 // ═══════════════════════════════════════
-let webcamStream=null, trackerIv=null;
+let trackerPollIv=null;
 
 async function startWebcam() {
   try {
-    webcamStream=await navigator.mediaDevices.getUserMedia({video:true});
-    const vid=document.getElementById('webcam-video'); vid.srcObject=webcamStream; vid.style.display='block';
+    const res=await fetch('/api/tracker/start',{method:'POST'});
+    if(!res.ok) throw new Error('start failed');
+    const img=document.getElementById('webcam-video');
+    img.src='/video_feed?t='+Date.now(); // cache-bust so a fresh MJPEG connection opens
+    img.style.display='block';
     document.getElementById('cam-placeholder').style.display='none';
     S.tracker={active:true,focused:0,total:0,blinks:0,fatigue:0,timeline:[],lastFocusPct:null};
     document.getElementById('focus-status-badge').textContent='● DETECTING...';
     document.getElementById('focus-status-badge').className='focus-status-badge';
     document.getElementById('focus-timeline').innerHTML='';
-    trackerIv=setInterval(trackerTick,500);
-  } catch(e){ toast('📷 Camera denied.\nPlease allow camera access.'); }
+    trackerPollIv=setInterval(trackerTick,500);
+  } catch(e){ toast('📷 Could not reach tracker.\nIs the Flask server running with a webcam attached?'); }
 }
 
-function stopWebcam() {
-  if(webcamStream){ webcamStream.getTracks().forEach(t=>t.stop()); webcamStream=null; }
-  clearInterval(trackerIv); S.tracker.active=false;
-  const vid=document.getElementById('webcam-video'); if(vid) vid.style.display='none';
+async function stopWebcam() {
+  clearInterval(trackerPollIv);
+  if(S.tracker) S.tracker.active=false;
+  try {
+    const res=await fetch('/api/tracker/stop',{method:'POST'});
+    const snap=await res.json();
+    if(snap.total_frames>0){
+      const pct=snap.focus_pct;
+      S.tracker.lastFocusPct=pct;
+      const scoreEl=document.getElementById('dash-focus-score'), scoreSub=document.getElementById('dash-focus-sub');
+      if(scoreEl) scoreEl.textContent=pct+'%';
+      if(scoreSub) scoreSub.textContent=pct>=70?'great focus today! ✨':'keep going, you got this 🌸';
+      const key=todayKey();
+      if(!S.analytics[key]) S.analytics[key]={studyMinutes:0,focusPct:null};
+      S.analytics[key].focusPct=pct;
+    }
+  } catch(e){ /* server may already be stopped; nothing to reconcile */ }
+  const img=document.getElementById('webcam-video'); if(img){ img.style.display='none'; img.src=''; }
   const ph=document.getElementById('cam-placeholder'); if(ph) ph.style.display='flex';
   document.getElementById('focus-status-badge').textContent='● CAMERA OFF';
   document.getElementById('focus-status-badge').className='focus-status-badge off';
-  if(S.tracker.total>0){
-    const pct=Math.round((S.tracker.focused/S.tracker.total)*100);
-    S.tracker.lastFocusPct=pct;
-    const scoreEl=document.getElementById('dash-focus-score'), scoreSub=document.getElementById('dash-focus-sub');
-    if(scoreEl) scoreEl.textContent=pct+'%';
-    if(scoreSub) scoreSub.textContent=pct>=70?'great focus today! ✨':'keep going, you got this 🌸';
-    const key=todayKey();
-    if(!S.analytics[key]) S.analytics[key]={studyMinutes:0,focusPct:null};
-    S.analytics[key].focusPct=pct;
-  }
 }
 
-function trackerTick(){
-  S.tracker.total++;
-  const focused=Math.random()>0.25; if(focused) S.tracker.focused++;
-  if(Math.random()<0.05) S.tracker.blinks++;
-  S.tracker.timeline.push(focused);
-  const minsElapsed=S.tracker.total/120;
-  S.tracker.fatigue=Math.min(100,Math.round(minsElapsed*1.5+(S.tracker.blinks*0.4)));
-  const pct=Math.round((S.tracker.focused/S.tracker.total)*100);
-  const distMin=Math.round((S.tracker.total-S.tracker.focused)/120);
-  const bpm=Math.round(S.tracker.blinks/Math.max(minsElapsed,0.1));
-  const fat=S.tracker.fatigue;
-  const longClosures=Math.floor(S.tracker.timeline.filter(v=>!v).length/6);
+async function trackerTick(){
+  let snap;
+  try {
+    const res=await fetch('/api/tracker/stats');
+    snap=await res.json();
+  } catch(e){ return; } // transient network hiccup; skip this tick
+
+  S.tracker.total=snap.total_frames;
+  S.tracker.focused=snap.focused_frames;
+  S.tracker.blinks=snap.blinks;
+  S.tracker.fatigue=snap.fatigue;
+
+  const pct=snap.focus_pct;
+  const distMin=snap.distracted_min;
+  const bpm=snap.blinks_per_min;
+  const fat=snap.fatigue;
+  const longClosures=snap.long_closures;
+  const focused=snap.status==='Focused';
 
   const badge=document.getElementById('focus-status-badge');
-  if(badge){badge.textContent=`● ${focused?'FOCUSED':'DISTRACTED'}`;badge.className=`focus-status-badge${focused?'':' distracted'}`;}
+  if(badge){badge.textContent=`● ${snap.status.toUpperCase()}`;badge.className=`focus-status-badge${focused?'':' distracted'}`;}
   const upd=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v;};
-  upd('at-focus-pct',pct+'%'); upd('at-distract',distMin+'m'); upd('at-blinks',S.tracker.blinks); upd('at-fatigue-pct',fat+'%');
+  upd('at-focus-pct',pct+'%'); upd('at-distract',distMin+'m'); upd('at-blinks',snap.blinks); upd('at-fatigue-pct',fat+'%');
   upd('fat-bpm',bpm); upd('fat-closures',longClosures);
 
   const fb=document.getElementById('fatigue-bar'); if(fb) fb.style.width=fat+'%';
   const fl=document.getElementById('fatigue-label'), er=document.getElementById('eye-ring'), el_=document.getElementById('eye-label');
   if(fat<33){ if(fl) fl.textContent='LOW · '+fat+'%'; if(er){er.textContent='👁️';er.className='eye-status-ring';} if(el_){el_.textContent='EYES OPEN';el_.style.color='var(--sage)';} }
   else if(fat<66){ if(fl) fl.textContent='MODERATE · '+fat+'%'; if(er){er.textContent='😑';er.className='eye-status-ring';} if(el_){el_.textContent='GETTING TIRED';el_.style.color='#b89a60';} }
-  else { if(fl) fl.textContent='HIGH · '+fat+'%'; if(er){er.textContent='😴';er.className='eye-status-ring tired';} if(el_){el_.textContent='EYES DROOPING';el_.style.color='var(--rose)';} if(fat>70&&S.tracker.total%60===0) toast('😴 Fatigue detected!\nTake a 5-min break!'); }
+  else { if(fl) fl.textContent='HIGH · '+fat+'%'; if(er){er.textContent='😴';er.className='eye-status-ring tired';} if(el_){el_.textContent='EYES DROOPING';el_.style.color='var(--rose)';} if(fat>70&&snap.total_frames%60===0) toast('😴 Fatigue detected!\nTake a 5-min break!'); }
 
-  if(S.tracker.total%10===0){
+  if(snap.total_frames%10===0){
     const tips=pct>70?['Great focus! Keep it up 🌿','You\'re in the zone! 🎯','Focus maintained ✨']:['Minimize distractions 🍓','Look at the screen 👀','Take a breath and refocus 🌸'];
     const ins=document.getElementById('live-insights');
     if(ins) ins.innerHTML=`<div class="insight-item"><div class="ins-icon">📊</div><div>Session: <strong>${pct}% focused</strong></div></div>
       <div class="insight-item"><div class="ins-icon">💡</div><div>${tips[Math.floor(Math.random()*tips.length)]}</div></div>
-      <div class="insight-item"><div class="ins-icon">👁️</div><div>Blinks: <strong>${S.tracker.blinks}</strong> · normal 15–20/min</div></div>
+      <div class="insight-item"><div class="ins-icon">👁️</div><div>Blinks: <strong>${snap.blinks}</strong> · normal 15–20/min</div></div>
       <div class="insight-item"><div class="ins-icon">😴</div><div>Fatigue: <strong>${fat<33?'Low':fat<66?'Moderate':'High'}</strong> (${fat}%)</div></div>`;
   }
 
   const tl=document.getElementById('focus-timeline');
-  if(tl){ const b=document.createElement('div'); const h=20+Math.random()*60; b.style.cssText=`flex:1;min-width:4px;height:${h}px;background:${focused?'var(--sage)':'var(--rose)'};border:1px solid var(--forest);border-radius:1px;`; tl.appendChild(b); while(tl.children.length>60) tl.removeChild(tl.firstChild); }
+  if(tl){ const h=focused?60+Math.random()*20:20+Math.random()*20; const b=document.createElement('div'); b.style.cssText=`flex:1;min-width:4px;height:${h}px;background:${focused?'var(--sage)':'var(--rose)'};border:1px solid var(--forest);border-radius:1px;`; tl.appendChild(b); while(tl.children.length>60) tl.removeChild(tl.firstChild); }
 }
 
 // ═══════════════════════════════════════
